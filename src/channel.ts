@@ -4,8 +4,16 @@ import type {
     ChannelPlugin,
     ChannelStatusIssue,
     OpenClawConfig,
-} from "openclaw/plugin-sdk";
-import { DEFAULT_ACCOUNT_ID, buildChannelConfigSchema } from "openclaw/plugin-sdk";
+} from "openclaw/plugin-sdk/compat";
+import {
+    DEFAULT_ACCOUNT_ID,
+    buildChannelConfigSchema,
+    registerWebhookTargetWithPluginRoute,
+    withResolvedWebhookRequestPipeline,
+    readWebhookBodyOrReject,
+    resolveWebhookTargetWithAuthOrRejectSync,
+    normalizeWebhookPath,
+} from "openclaw/plugin-sdk/compat";
 import { ServerChanBotConfigSchema } from "./config-schema.js";
 import {
     serverChanBotGetMe,
@@ -87,9 +95,10 @@ type WebhookTarget = {
     statusSink?: (patch: { lastInboundAt?: number; lastOutboundAt?: number }) => void;
 };
 
+// Webhook targets stored via SDK's registerWebhookTargetWithPluginRoute
 const webhookTargets = new Map<string, WebhookTarget[]>();
 
-function normalizeWebhookPath(raw: string): string {
+function normalizeWebhookPath$1(raw: string): string {
     const trimmed = raw.trim();
     if (!trimmed) {
         return "/";
@@ -99,6 +108,80 @@ function normalizeWebhookPath(raw: string): string {
         return withSlash.slice(0, -1);
     }
     return withSlash;
+}
+
+async function handleServerChanBotWebhookRequest(
+    req: IncomingMessage,
+    res: ServerResponse,
+): Promise<boolean> {
+    const url = new URL(req.url ?? "/", "http://localhost");
+    const path = normalizeWebhookPath$1(url.pathname);
+    const targets = webhookTargets.get(path);
+    if (!targets || targets.length === 0) {
+        return false;
+    }
+
+    if (req.method !== "POST") {
+        res.statusCode = 405;
+        res.setHeader("Allow", "POST");
+        res.end("Method Not Allowed");
+        return true;
+    }
+
+    const selected = selectWebhookTarget(targets, req.headers);
+    if (!selected) {
+        res.statusCode = 401;
+        res.end("unauthorized");
+        return true;
+    }
+
+    const body = await readWebhookBodyOrReject(req);
+    if (!body.ok) {
+        res.statusCode = body.error === "payload too large" ? 413 : 400;
+        res.end(body.error ?? "invalid payload");
+        return true;
+    }
+
+    const update = parseWebhookPayload(body.value);
+    if (!update) {
+        res.statusCode = 400;
+        res.end("invalid payload");
+        return true;
+    }
+
+    selected.statusSink?.({ lastInboundAt: Date.now() });
+    processServerChanBotUpdate({
+        update,
+        account: selected.account,
+        cfg: selected.config,
+        botToken: selected.botToken,
+        log: selected.log,
+        statusSink: selected.statusSink,
+    }).catch((err) => {
+        selected.log?.error?.(`[${selected.account.accountId}] webhook error: ${String(err)}`);
+    });
+
+    res.statusCode = 200;
+    res.end("ok");
+    return true;
+}
+
+export function registerServerChanBotWebhookTarget(target: WebhookTarget): () => void {
+    // Use SDK's registerWebhookTargetWithPluginRoute
+    const unregister = registerWebhookTargetWithPluginRoute({
+        targetsByPath: webhookTargets,
+        target,
+        route: {
+            auth: "plugin",
+            match: "exact",
+            pluginId: "openclaw-serverchan-bot",
+            source: "serverchan-bot-webhook",
+            accountId: target.account.accountId,
+            log: target.log,
+            handler: handleServerChanBotWebhookRequest,
+        },
+    });
+    return unregister;
 }
 
 function resolveWebhookPath(webhookPath?: string, webhookUrl?: string): string | null {
@@ -196,22 +279,6 @@ function selectWebhookTarget(
         return withoutSecret[0];
     }
     return null;
-}
-
-export function registerServerChanBotWebhookTarget(target: WebhookTarget): () => void {
-    const key = normalizeWebhookPath(target.path);
-    const normalizedTarget = { ...target, path: key };
-    const existing = webhookTargets.get(key) ?? [];
-    const next = [...existing, normalizedTarget];
-    webhookTargets.set(key, next);
-    return () => {
-        const updated = (webhookTargets.get(key) ?? []).filter((entry) => entry !== normalizedTarget);
-        if (updated.length > 0) {
-            webhookTargets.set(key, updated);
-        } else {
-            webhookTargets.delete(key);
-        }
-    };
 }
 
 async function processServerChanBotUpdate(params: {
@@ -314,61 +381,8 @@ async function processServerChanBotUpdate(params: {
     }
 }
 
-export async function handleServerChanBotWebhookRequest(
-    req: IncomingMessage,
-    res: ServerResponse,
-): Promise<boolean> {
-    const url = new URL(req.url ?? "/", "http://localhost");
-    const path = normalizeWebhookPath(url.pathname);
-    const targets = webhookTargets.get(path);
-    if (!targets || targets.length === 0) {
-        return false;
-    }
-
-    if (req.method !== "POST") {
-        res.statusCode = 405;
-        res.setHeader("Allow", "POST");
-        res.end("Method Not Allowed");
-        return true;
-    }
-
-    const selected = selectWebhookTarget(targets, req.headers);
-    if (!selected) {
-        res.statusCode = 401;
-        res.end("unauthorized");
-        return true;
-    }
-
-    const body = await readJsonBody(req, 1024 * 1024);
-    if (!body.ok) {
-        res.statusCode = body.error === "payload too large" ? 413 : 400;
-        res.end(body.error ?? "invalid payload");
-        return true;
-    }
-
-    const update = parseWebhookPayload(body.value);
-    if (!update) {
-        res.statusCode = 400;
-        res.end("invalid payload");
-        return true;
-    }
-
-    selected.statusSink?.({ lastInboundAt: Date.now() });
-    processServerChanBotUpdate({
-        update,
-        account: selected.account,
-        cfg: selected.config,
-        botToken: selected.botToken,
-        log: selected.log,
-        statusSink: selected.statusSink,
-    }).catch((err) => {
-        selected.log?.error?.(`[${selected.account.accountId}] webhook error: ${String(err)}`);
-    });
-
-    res.statusCode = 200;
-    res.end("ok");
-    return true;
-}
+// The handleServerChanBotWebhookRequest function is now defined in registerServerChanBotWebhookTarget
+// using registerWebhookTargetWithPluginRoute from the SDK
 
 /**
  * Resolve account configuration from OpenClaw config
