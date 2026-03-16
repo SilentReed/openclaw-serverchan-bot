@@ -55,6 +55,10 @@ export type ServerChanSendResult = {
     error?: string;
 };
 
+export type SendChatActionOptions = {
+    action?: "typing";
+};
+
 export type SendMessageOptions = {
     parseMode?: "text" | "markdown";
     silent?: boolean;
@@ -226,4 +230,37 @@ export function verifyWebhookSecret(
     const secret = headers["x-sc3bot-webhook-secret"] ?? headers["X-Sc3Bot-Webhook-Secret"];
     const secretValue = Array.isArray(secret) ? secret[0] : secret;
     return secretValue === expectedSecret;
+}
+
+/**
+ * Send chat action (typing status)
+ */
+export async function serverChanBotSendChatAction(
+    token: string,
+    chatId: number | string,
+    options?: SendChatActionOptions,
+): Promise<ServerChanSendResult> {
+    const url = `${API_BASE_URL}/bot${token}/sendChatAction`;
+
+    const body: Record<string, unknown> = {
+        chat_id: typeof chatId === "string" ? Number.parseInt(chatId, 10) : chatId,
+        action: options?.action || "typing",
+    };
+
+    const response = await fetch(url, {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
+    });
+
+    if (!response.ok) {
+        return {
+            ok: false,
+            error: `HTTP ${response.status}: ${response.statusText}`,
+        };
+    }
+
+    return (await response.json()) as ServerChanSendResult;
 }
